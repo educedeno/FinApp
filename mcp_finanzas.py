@@ -29,21 +29,46 @@ from google.oauth2.service_account import Credentials
 from mcp.server.fastmcp import FastMCP
 
 # ---------------------------------------------------------------------------
-# Conexión al Google Sheet
+# Conexión al Google Sheet (perezosa: se conecta al primer uso, no al arrancar,
+# para que un error de configuración no tumbe el servidor en bucle)
 # ---------------------------------------------------------------------------
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 SHEET_NOMBRE = os.environ.get("SHEET_NOMBRE", "Finanzas Eduardo")
 
-# Las credenciales pueden venir como RUTA a un archivo (local) o como el
-# CONTENIDO del JSON pegado en la variable de entorno (hosting).
-_creds_raw = os.environ["GOOGLE_CREDS_JSON"]
-if os.path.exists(_creds_raw):
-    creds = Credentials.from_service_account_file(_creds_raw, scopes=SCOPES)
-else:
-    creds = Credentials.from_service_account_info(json.loads(_creds_raw), scopes=SCOPES)
+_libro = None
 
-gc = gspread.authorize(creds)
-libro = gc.open(SHEET_NOMBRE)
+
+def _conectar():
+    raw = os.environ.get("GOOGLE_CREDS_JSON")
+    if not raw:
+        raise RuntimeError("Falta la variable de entorno GOOGLE_CREDS_JSON.")
+    # Puede ser una RUTA a archivo (local) o el CONTENIDO del JSON (hosting).
+    if os.path.exists(raw):
+        creds = Credentials.from_service_account_file(raw, scopes=SCOPES)
+    else:
+        try:
+            info = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                "GOOGLE_CREDS_JSON no es un JSON válido. Verifica que pegaste el "
+                f"contenido completo del archivo de credenciales. Detalle: {e}"
+            )
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    try:
+        return gspread.authorize(creds).open(SHEET_NOMBRE)
+    except gspread.SpreadsheetNotFound:
+        raise RuntimeError(
+            f"No se encontró un Google Sheet llamado '{SHEET_NOMBRE}'. Revisa que "
+            "el nombre en SHEET_NOMBRE coincida EXACTO y que compartiste el Sheet "
+            "con el email de la cuenta de servicio (permiso de editor)."
+        )
+
+
+def _get_libro():
+    global _libro
+    if _libro is None:
+        _libro = _conectar()
+    return _libro
 
 # Categorías válidas (deben coincidir con el bundle OKF)
 CATS_GASTO = {
@@ -67,7 +92,7 @@ mcp = FastMCP("finanzas-eduardo")
 
 
 def _filas(hoja: str) -> list[dict]:
-    return libro.worksheet(hoja).get_all_records()
+    return _get_libro().worksheet(hoja).get_all_records()
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +177,7 @@ def registrar_gasto(monto: float, categoria: str, cuenta: str,
         return (f"⚠️ Gasto de ${monto:,.2f} en '{categoria}' supera ${LIMITE_GASTO:.0f}. "
                 f"Confirma que el monto es correcto y vuelve a llamar con confirmado=True.")
     fila = [str(date.today()), categoria, cuenta, round(monto, 2), comentario]
-    libro.worksheet("gastos").append_row(fila)
+    _get_libro().worksheet("gastos").append_row(fila)
     return f"✓ Gasto registrado: ${monto:,.2f} en {categoria} ({cuenta}) — {comentario}"
 
 
@@ -171,7 +196,7 @@ def registrar_ingreso(monto: float, categoria: str, cuenta: str,
         return (f"⚠️ Ingreso de ${monto:,.2f} en '{categoria}' supera ${LIMITE_INGRESO:.0f}. "
                 f"Confirma que el monto es correcto y vuelve a llamar con confirmado=True.")
     fila = [str(date.today()), categoria, cuenta, round(monto, 2), comentario]
-    libro.worksheet("ingresos").append_row(fila)
+    _get_libro().worksheet("ingresos").append_row(fila)
     return f"✓ Ingreso registrado: ${monto:,.2f} en {categoria} ({cuenta}) — {comentario}"
 
 
@@ -184,18 +209,29 @@ def registrar_transferencia(origen: str, destino: str, monto: float,
         return (f"{', '.join(cerradas)}: cuenta(s) de deuda cerrada(s), no se usan "
                 f"para movimientos nuevos. No se registró nada.")
     fila = [str(date.today()), origen, destino, round(monto, 2), comentario]
-    libro.worksheet("transferencias").append_row(fila)
+    _get_libro().worksheet("transferencias").append_row(fila)
     return f"✓ Transferencia registrada: ${monto:,.2f} de {origen} a {destino}"
 
 
 if __name__ == "__main__":
     if os.environ.get("TRANSPORT") == "http":
         # --- Modo remoto/hosteado: HTTP con autenticación por token ---
+        import sys
         import uvicorn
         from starlette.middleware.base import BaseHTTPMiddleware
         from starlette.responses import JSONResponse
 
-        API_KEY = os.environ["MCP_API_KEY"]
+        API_KEY = os.environ.get("MCP_API_KEY")
+        if not API_KEY:
+            print("ERROR: falta la variable MCP_API_KEY. El servidor no puede "
+                  "arrancar en modo remoto sin un token.", file=sys.stderr)
+            sys.exit(1)
+
+        puerto = int(os.environ.get("PORT", "8000"))
+        print(f"[finanzas-mcp] Arrancando en modo HTTP, puerto {puerto}", flush=True)
+        print(f"[finanzas-mcp] Sheet objetivo: '{SHEET_NOMBRE}'", flush=True)
+        print("[finanzas-mcp] La conexión a Google Sheets se hará al primer uso.",
+              flush=True)
 
         class AuthMiddleware(BaseHTTPMiddleware):
             """Exige el token secreto en cada petición. Sin él, 401.
@@ -210,10 +246,10 @@ if __name__ == "__main__":
                 return await call_next(request)
 
         mcp.settings.host = "0.0.0.0"
-        mcp.settings.port = int(os.environ.get("PORT", "8000"))
+        mcp.settings.port = puerto
         app = mcp.streamable_http_app()
         app.add_middleware(AuthMiddleware)
-        uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
+        uvicorn.run(app, host="0.0.0.0", port=puerto)
     else:
         # --- Modo local: stdio para Claude Desktop ---
         mcp.run()
