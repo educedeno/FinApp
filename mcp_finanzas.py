@@ -33,7 +33,10 @@ from mcp.server.transport_security import TransportSecuritySettings
 # Conexión al Google Sheet (perezosa: se conecta al primer uso, no al arrancar,
 # para que un error de configuración no tumbe el servidor en bucle)
 # ---------------------------------------------------------------------------
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.file",
+]
 SHEET_NOMBRE = os.environ.get("SHEET_NOMBRE", "Finanzas Eduardo")
 
 _libro = None
