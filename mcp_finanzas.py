@@ -235,12 +235,18 @@ if __name__ == "__main__":
 
         class AuthMiddleware(BaseHTTPMiddleware):
             """Exige el token secreto en cada petición. Sin él, 401.
-            Claude lo envía como header x-api-key (o Authorization: Bearer ...)."""
+            Acepta el token de tres formas (usa la que tu cliente permita):
+              - header x-api-key
+              - header Authorization: Bearer <token>
+              - dentro de la URL como ?key=<token>  (lo más compatible)"""
             async def dispatch(self, request, call_next):
                 enviado = request.headers.get("x-api-key")
                 if not enviado:
                     auth = request.headers.get("authorization", "")
                     enviado = auth[7:] if auth.lower().startswith("bearer ") else auth
+                if not enviado:
+                    enviado = (request.query_params.get("key")
+                               or request.query_params.get("token"))
                 if enviado != API_KEY:
                     return JSONResponse({"error": "no autorizado"}, status_code=401)
                 return await call_next(request)
