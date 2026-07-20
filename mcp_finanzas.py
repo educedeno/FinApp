@@ -27,6 +27,7 @@ from datetime import date
 import gspread
 from google.oauth2.service_account import Credentials
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 # ---------------------------------------------------------------------------
 # Conexión al Google Sheet (perezosa: se conecta al primer uso, no al arrancar,
@@ -88,7 +89,21 @@ LIMITE_INGRESO = 1000.0
 # para movimientos nuevos (ver cuentas.md en el bundle OKF).
 CUENTAS_CERRADAS = {"Juanse", "Lucas", "Moses"}
 
-mcp = FastMCP("finanzas-eduardo")
+# La protección DNS-rebinding del MCP bloquea por defecto cualquier host que no
+# esté en una lista blanca (pensada para servidores locales). Como este servidor
+# es remoto y ya está protegido por token, la desactivamos para que acepte el
+# dominio de Railway. Si prefieres restringir, define ALLOWED_HOST con tu dominio.
+_host_permitido = os.environ.get("ALLOWED_HOST")
+if _host_permitido:
+    _seguridad = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[_host_permitido],
+        allowed_origins=[f"https://{_host_permitido}"],
+    )
+else:
+    _seguridad = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+mcp = FastMCP("finanzas-eduardo", transport_security=_seguridad)
 
 
 def _filas(hoja: str) -> list[dict]:
@@ -217,9 +232,9 @@ if __name__ == "__main__":
     if os.environ.get("TRANSPORT") == "http":
         # --- Modo remoto/hosteado: HTTP con autenticación por token ---
         import sys
+        from urllib.parse import parse_qs
+
         import uvicorn
-        from starlette.middleware.base import BaseHTTPMiddleware
-        from starlette.responses import JSONResponse
 
         API_KEY = os.environ.get("MCP_API_KEY")
         if not API_KEY:
@@ -233,28 +248,40 @@ if __name__ == "__main__":
         print("[finanzas-mcp] La conexión a Google Sheets se hará al primer uso.",
               flush=True)
 
-        class AuthMiddleware(BaseHTTPMiddleware):
-            """Exige el token secreto en cada petición. Sin él, 401.
-            Acepta el token de tres formas (usa la que tu cliente permita):
-              - header x-api-key
-              - header Authorization: Bearer <token>
-              - dentro de la URL como ?key=<token>  (lo más compatible)"""
-            async def dispatch(self, request, call_next):
-                enviado = request.headers.get("x-api-key")
-                if not enviado:
-                    auth = request.headers.get("authorization", "")
-                    enviado = auth[7:] if auth.lower().startswith("bearer ") else auth
-                if not enviado:
-                    enviado = (request.query_params.get("key")
-                               or request.query_params.get("token"))
-                if enviado != API_KEY:
-                    return JSONResponse({"error": "no autorizado"}, status_code=401)
-                return await call_next(request)
+        def _extraer_token(scope) -> str:
+            headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
+            tok = headers.get("x-api-key", "")
+            if not tok:
+                auth = headers.get("authorization", "")
+                tok = auth[7:] if auth.lower().startswith("bearer ") else auth
+            if not tok:
+                qs = parse_qs(scope.get("query_string", b"").decode())
+                tok = (qs.get("key") or qs.get("token") or [""])[0]
+            return tok
+
+        class AuthASGI:
+            """Middleware ASGI puro: valida el token sin tocar el cuerpo de la
+            respuesta, para no romper el streaming que usa MCP.
+            Acepta el token por header x-api-key, Authorization: Bearer, o ?key= en la URL."""
+            def __init__(self, app, api_key):
+                self.app = app
+                self.api_key = api_key
+
+            async def __call__(self, scope, receive, send):
+                if scope["type"] != "http":
+                    await self.app(scope, receive, send)  # lifespan, etc.
+                    return
+                if _extraer_token(scope) != self.api_key:
+                    await send({"type": "http.response.start", "status": 401,
+                                "headers": [(b"content-type", b"application/json")]})
+                    await send({"type": "http.response.body",
+                                "body": b'{"error":"no autorizado"}'})
+                    return
+                await self.app(scope, receive, send)
 
         mcp.settings.host = "0.0.0.0"
         mcp.settings.port = puerto
-        app = mcp.streamable_http_app()
-        app.add_middleware(AuthMiddleware)
+        app = AuthASGI(mcp.streamable_http_app(), API_KEY)
         uvicorn.run(app, host="0.0.0.0", port=puerto)
     else:
         # --- Modo local: stdio para Claude Desktop ---
